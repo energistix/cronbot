@@ -1,17 +1,110 @@
-import { Client, GatewayIntentBits, Message, TextChannel } from "discord.js"
+import {
+  Client,
+  GatewayIntentBits,
+  Message,
+  MessageReaction,
+  PartialMessageReaction,
+  PermissionsBitField,
+  TextChannel,
+  User,
+} from "discord.js"
 import Database from "bun:sqlite"
 import cron from "node-cron"
 
 // Initialize SQLite database
 const db = new Database("cronbot.db")
 
+class Pager {
+  private static pagers = new Map<string, Pager>()
+
+  private page: number
+  private totalPages: number
+  private perPage: number = 10
+  private totalItems: number
+  private itemsPerPage: number
+  private items: string[]
+  private message?: Message
+
+  constructor(items: string[], channel: TextChannel) {
+    this.items = items
+    this.totalItems = items.length
+    this.itemsPerPage = Math.ceil(this.totalItems / this.perPage)
+    this.page = 1
+    this.totalPages = this.itemsPerPage
+    this.sendMessage(channel).then((message) => {
+      this.message = message
+      this.editMessage()
+      Pager.pagers.set(this.message.id, this)
+    })
+  }
+
+  async sendMessage(channel: TextChannel) {
+    const message = await channel.send(
+      `Page ${this.page} of ${this.totalPages}`
+    )
+    message.react("⬅️")
+    message.react("➡️")
+    return message
+  }
+
+  next() {
+    this.page = Math.min(this.page + 1, this.totalPages)
+    this.editMessage()
+    return this.page
+  }
+  prev() {
+    this.page = Math.max(this.page - 1, 1)
+    this.editMessage()
+    return this.page
+  }
+
+  static getPager(id: string) {
+    return Pager.pagers.get(id)
+  }
+
+  static async deletePager(id: string) {
+    const pager = Pager.pagers.get(id)
+    if (pager) {
+      await pager.message?.delete()
+      Pager.pagers.delete(id)
+    }
+  }
+
+  processReaction(reaction: MessageReaction | PartialMessageReaction) {
+    if (reaction.emoji.name === "⬅️") {
+      this.prev()
+      reaction.users.cache.forEach((user) => {
+        if (user.id !== client.user?.id) reaction.users.remove(user)
+      })
+      reaction.message.react("⬅️")
+    } else if (reaction.emoji.name === "➡️") {
+      this.next()
+      reaction.users.cache.forEach((user) => {
+        if (user.id !== client.user?.id) reaction.users.remove(user)
+      })
+      reaction.message.react("➡️")
+    }
+    this.editMessage()
+  }
+
+  editMessage() {
+    this.message?.edit(
+      `Page ${this.page} of ${this.totalPages}\n` +
+        this.items
+          .slice((this.page - 1) * this.perPage, this.page * this.perPage)
+          .join("\n")
+    )
+  }
+}
+
 // Create the table for cron jobs if it doesn't exist
 await db.exec(`
   CREATE TABLE IF NOT EXISTS cronJobs (
-    id TEXT PRIMARY KEY,
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
     cronTime TEXT,
     message TEXT,
-    channelId TEXT
+    channelId TEXT,
+    guildId TEXT
   );
 `)
 
@@ -20,6 +113,7 @@ const client = new Client({
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.MessageContent,
+    GatewayIntentBits.GuildMessageReactions,
   ],
 })
 
@@ -35,13 +129,23 @@ client.on("messageCreate", async (message: Message) => {
 
   // Check if the message starts with the prefix and the command "addcron"
   if (message.content.startsWith("+addcron")) {
+    if (
+      !message.member?.permissions.has(PermissionsBitField.Flags.ManageGuild)
+    ) {
+      return message.reply(
+        "You require the permission `MANAGE_GUILD` have permission to delete cron jobs."
+      )
+    }
     try {
       const { cronExpression, messageToSend } = parseCronJob(message.content)
-      console.log(`${cronExpression} : ${messageToSend}`)
 
       // Expect two arguments: cronTime and message
       if (!cronExpression || !messageToSend) {
         return message.reply("Usage: +addcron <cronTime> <message>")
+      }
+
+      if (!message.guild) {
+        return message.reply("This command is only available in servers.")
       }
 
       // Validate cron expression
@@ -50,10 +154,9 @@ client.on("messageCreate", async (message: Message) => {
       }
 
       // Store the cron job in SQLite
-      const jobId = `${message.author.id}-${Date.now()}`
       await db.run(
-        "INSERT INTO cronJobs (id, cronTime, message, channelId) VALUES (?, ?, ?, ?)",
-        [jobId, cronExpression, messageToSend, message.channel.id]
+        "INSERT INTO cronJobs (cronTime, message, channelId, guildId) VALUES (?, ?, ?, ?)",
+        [cronExpression, messageToSend, message.channel.id, message.guild.id]
       )
 
       // Schedule the cron job
@@ -69,6 +172,64 @@ client.on("messageCreate", async (message: Message) => {
       console.error(error)
       return message.reply("Usage: +addcron <cronTime> <message>")
     }
+  } else if (message.content.startsWith("+listcron")) {
+    try {
+      if (!message.guild) {
+        return message.reply("This command is only available in servers.")
+      }
+
+      const rows = await db
+        .prepare("SELECT * FROM cronJobs WHERE guildId = ?", [message.guild.id])
+        .all()
+
+      const formattedRows = rows.map((row) => {
+        // @ts-ignore
+        return `${row.id}: ${row.cronTime} - ${row.message.slice(0, 100)}`
+      })
+
+      new Pager(formattedRows, message.channel as TextChannel)
+    } catch (error) {
+      console.error(error)
+      return message.reply("An error occurred while listing cron jobs.")
+    }
+  } else if (message.content.startsWith("+deletecron")) {
+    if (
+      !message.member?.permissions.has(PermissionsBitField.Flags.ManageGuild)
+    ) {
+      return message.reply(
+        "You require the permission `MANAGE_GUILD` have permission to delete cron jobs."
+      )
+    }
+    try {
+      if (!message.guild) {
+        return message.reply("This command is only available in servers.")
+      }
+
+      const { id } = parseDeleteJob(message.content)
+
+      // Delete the cron job from SQLite
+      await db.run("DELETE FROM cronJobs WHERE id = ?", [id])
+
+      return message.reply(`Cron job deleted!`)
+    } catch (error) {
+      console.error(error)
+      return message.reply("Usage: +delete <id>")
+    }
+  } else if (message.content.startsWith("+help")) {
+    return message.reply(
+      "Commands:\n" +
+        "+addcron <cronTime> <message>\n" +
+        "+listcron\n" +
+        "+deletecron <id>"
+    )
+  }
+})
+
+client.on("messageReactionAdd", async (reaction, user) => {
+  if (user.bot) return
+  const pager = Pager.getPager(reaction.message.id)
+  if (pager) {
+    pager.processReaction(reaction)
   }
 })
 
@@ -84,6 +245,17 @@ function parseCronJob(input: string) {
   return {
     cronExpression,
     messageToSend,
+  }
+}
+
+function parseDeleteJob(input: string) {
+  // Split the input into parts: the id
+  const parts = input.split(" ")
+
+  const id = parts[1]
+
+  return {
+    id,
   }
 }
 
